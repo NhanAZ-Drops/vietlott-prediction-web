@@ -63,6 +63,27 @@ def _digit_dataset(draws: int) -> ProductDataset:
     )
 
 
+def _constant_digit_dataset(draws: int) -> ProductDataset:
+    product = PRODUCTS["bingo18"]
+    start = date(2024, 1, 1)
+    observations = [
+        Observation(
+            draw_id=str(index + 1).zfill(5),
+            draw_date=start + timedelta(days=index),
+            outcomes=("111",),
+        )
+        for index in range(draws)
+    ]
+    return ProductDataset(
+        product=product,
+        observations=observations,
+        source_counts=Counter({"vietlott.vn": draws}),
+        status_counts=Counter({"confirmed": draws}),
+        validation_counts=Counter({"valid": draws}),
+        latest_fetched_at=f"2024-03-{min(draws, 28):02d}T00:00:00+00:00",
+    )
+
+
 def _number_observation_counts(observations: list[Observation]) -> Counter[int]:
     return Counter(value for item in observations for value in item.values)
 
@@ -113,8 +134,11 @@ def test_prediction_ledger_is_idempotent_and_appends_evaluations(tmp_path) -> No
     assert len(report["pending_predictions"]) == report["pending_count"] == 4
     assert report["pending_predictions"][0]["prediction"]
     assert report["pending_predictions"][0]["prediction_generated_at"]
+    assert report["pending_predictions"][0]["target"] == "first_confirmed_draw_after_cutoff"
+    assert report["pending_predictions"][0]["target_description"]
     assert report["recent_evaluations"][0]["prediction"]
     assert report["recent_evaluations"][0]["prediction_generated_at"]
+    assert report["recent_evaluations"][0]["target"] == "first_confirmed_draw_after_cutoff"
     assert report["recent_evaluations"][0]["outcome"]["status"] in {
         "exact",
         "near",
@@ -132,6 +156,119 @@ def test_prediction_ledger_is_idempotent_and_appends_evaluations(tmp_path) -> No
     reloaded = PredictionLedger.load(path)
     assert reloaded.validate_integrity()["status"] == "valid"
     assert reloaded.site_report()["ledger_integrity"]["root_hash"] == saved[-1]["event_hash"]
+
+
+def test_number_forecasts_avoid_duplicate_model_tickets(monkeypatch, tmp_path) -> None:
+    def duplicate_prone_scores(
+        product,
+        total_counts,
+        total_draws,
+        recent_counts,
+        recent_draws,
+        short_counts,
+        short_draws,
+        last_seen,
+        current_index,
+    ):
+        del total_counts, total_draws, recent_counts, recent_draws
+        del short_counts, short_draws, last_seen, current_index
+        rows = {}
+        for value in range(product.pool_min or 1, (product.pool_max or 0) + 1):
+            score = ((product.pool_max or 0) + 1 - value) / (product.pool_max or 1)
+            rows[value] = {
+                "long_z": score,
+                "recent_z": score,
+                "short_z": score,
+                "overdue_ratio": 1.0,
+                "recent": score,
+                "balanced_no_overdue": score,
+                "balanced": score,
+            }
+        return rows
+
+    monkeypatch.setattr(predictions_module, "_number_scores", duplicate_prone_scores)
+
+    ledger = PredictionLedger.load(tmp_path / "ledger.jsonl")
+    ledger.process_product(_dataset(40))
+    first_predictions = [
+        event
+        for event in ledger.events
+        if event["event_type"] == "prediction" and event["strategy"] != "uniform_seeded"
+    ]
+    first_by_strategy = {
+        event["strategy"]: tuple(event["prediction"]["numbers"])
+        for event in first_predictions
+    }
+
+    assert len(first_predictions) == 3
+    assert len(set(first_by_strategy.values())) == 3
+    assert any(
+        event["parameters"]["duplicate_guard"]["adjusted"]
+        for event in first_predictions
+    )
+
+    ledger.process_product(_dataset(41))
+    evaluated_ids = {
+        event["prediction_id"]
+        for event in ledger.events
+        if event["event_type"] == "evaluation"
+    }
+    pending_predictions = [
+        event
+        for event in ledger.events
+        if event["event_type"] == "prediction"
+        and event["prediction_id"] not in evaluated_ids
+        and event["strategy"] != "uniform_seeded"
+    ]
+    pending_by_strategy = {
+        event["strategy"]: tuple(event["prediction"]["numbers"])
+        for event in pending_predictions
+    }
+
+    assert len(pending_predictions) == 3
+    assert len(set(pending_by_strategy.values())) == 3
+    for strategy, numbers in pending_by_strategy.items():
+        assert numbers != first_by_strategy[strategy]
+
+
+def test_digit_forecasts_avoid_duplicate_model_sequences(tmp_path) -> None:
+    ledger = PredictionLedger.load(tmp_path / "ledger.jsonl")
+    ledger.process_product(_constant_digit_dataset(40))
+    first_predictions = [
+        event
+        for event in ledger.events
+        if event["event_type"] == "prediction" and event["strategy"] != "uniform_seeded"
+    ]
+    first_by_strategy = {
+        event["strategy"]: event["prediction"]["sequence"]
+        for event in first_predictions
+    }
+
+    assert len(first_predictions) == 3
+    assert len(set(first_by_strategy.values())) == 3
+
+    ledger.process_product(_constant_digit_dataset(41))
+    evaluated_ids = {
+        event["prediction_id"]
+        for event in ledger.events
+        if event["event_type"] == "evaluation"
+    }
+    pending_predictions = [
+        event
+        for event in ledger.events
+        if event["event_type"] == "prediction"
+        and event["prediction_id"] not in evaluated_ids
+        and event["strategy"] != "uniform_seeded"
+    ]
+    pending_by_strategy = {
+        event["strategy"]: event["prediction"]["sequence"]
+        for event in pending_predictions
+    }
+
+    assert len(pending_predictions) == 3
+    assert len(set(pending_by_strategy.values())) == 3
+    for strategy, sequence in pending_by_strategy.items():
+        assert sequence != first_by_strategy[strategy]
 
 
 def test_prediction_ledger_detects_historical_tampering(tmp_path) -> None:
@@ -1103,9 +1240,9 @@ def test_prediction_report_prefers_newer_model_for_same_cutoff(tmp_path) -> None
     assert latest["prediction_id"] == "newer-model"
     assert latest["prediction"]["numbers"] == [7, 8, 9, 10, 11, 12]
     assert {row["prediction_id"] for row in report["pending_predictions"]} == {
-        "newer-model",
-        "older-model",
+        "newer-model"
     }
+    assert report["superseded_prediction_count"] == 1
 
 
 def test_prediction_report_uses_strict_exact_and_near_rules(tmp_path) -> None:

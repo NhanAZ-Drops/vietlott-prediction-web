@@ -2107,7 +2107,7 @@ function renderPredictionCards(slug) {
   text(
     "prediction-ledger-status",
     latest
-      ? `Dùng dữ liệu đến kỳ #${latest.dataset_cutoff_draw_id} ngày ${formatDate(latest.dataset_cutoff_date)}`
+      ? `${predictionTargetLabel(latest)} · Dùng dữ liệu đến kỳ #${latest.dataset_cutoff_draw_id} ngày ${formatDate(latest.dataset_cutoff_date)}`
       : "Chưa có dự đoán",
   );
   document.getElementById("prediction-cards").innerHTML = predictions
@@ -2128,6 +2128,7 @@ function renderPredictionCards(slug) {
           ${output}
           <div class="prediction-meta">
             <span>Mã lưu vết ${escapeHtml(prediction.prediction_id)}</span>
+            <span>${escapeHtml(predictionTargetLabel(prediction))}</span>
             <span>Dữ liệu đến kỳ #${escapeHtml(prediction.dataset_cutoff_draw_id)}</span>
           </div>
         </article>`;
@@ -2139,6 +2140,14 @@ function renderPredictionCards(slug) {
   }
   renderPredictionResults(slug);
   if (product) document.getElementById("prediction-product").value = product.slug;
+}
+
+function predictionTargetLabel(prediction) {
+  if (!prediction) return "Chưa có kỳ mục tiêu";
+  if (prediction.target === "first_confirmed_draw_after_cutoff") {
+    return `Kỳ mục tiêu: kỳ xác nhận đầu tiên sau #${prediction.dataset_cutoff_draw_id}`;
+  }
+  return prediction.target_description || "Kỳ mục tiêu chưa xác định";
 }
 
 function renderPredictionResults(slug) {
@@ -2474,7 +2483,7 @@ function renderPendingPrediction(prediction) {
         </div>
         <b>chờ</b>
         <div>
-          <span>Kết quả sau kỳ #${escapeHtml(prediction.dataset_cutoff_draw_id)}</span>
+          <span>${escapeHtml(predictionTargetLabel(prediction))}</span>
           <div class="prediction-pending-result">Chưa có kết quả xác nhận</div>
         </div>
       </div>

@@ -18,7 +18,7 @@ from typing import Any
 from .catalog import PRODUCTS, AnalysisKind, AnalyticsProduct
 from .io import Observation, ProductDataset
 
-MODEL_VERSION = "1.3.0"
+MODEL_VERSION = "1.3.1"
 LEDGER_CHAIN_VERSION = 1
 NUMBER_SCORE_POLICY = (
     "recent=0.6*short+0.4*recent; "
@@ -143,6 +143,8 @@ BACKTEST_PAIRED_PERMUTATION_MAX_VALUES = 800
 BACKTEST_PRACTICAL_EFFECT_THRESHOLD = 0.05
 PREDICTION_BASELINE_CONFIDENCE_LEVEL = 0.95
 PREDICTION_BASELINE_MIN_EVALUATIONS_FOR_CLAIM = 30
+DUPLICATE_GUARD_HISTORY_LIMIT = 12
+PredictionSignature = tuple[str, tuple[int, ...] | str]
 BACKTEST_COMMON_REJECTED_CONFIGURATIONS = (
     {
         "config_id": "posthoc_best_variant_picker",
@@ -239,8 +241,9 @@ class PredictionLedger:
             for event in self.events
             if event.get("event_type") == "evaluation"
         }
+        superseded = _superseded_prediction_ids(predictions.values(), evaluated)
         for prediction_id, prediction in predictions.items():
-            if prediction_id in evaluated:
+            if prediction_id in evaluated or prediction_id in superseded:
                 continue
             actual = _first_observation_after(dataset.observations, prediction)
             if actual is not None:
@@ -259,7 +262,7 @@ class PredictionLedger:
             )
             for event in predictions.values()
         }
-        for forecast in _forecast_events(dataset):
+        for forecast in _forecast_events(dataset, predictions.values()):
             key = (
                 dataset.product.slug,
                 latest.draw_id,
@@ -437,8 +440,15 @@ class PredictionLedger:
                 "score_distribution": _score_distribution(rows),
             }
 
+        superseded_prediction_ids = _superseded_prediction_ids(
+            predictions,
+            evaluated_ids,
+        )
         pending = [
-            prediction for prediction in predictions if prediction["prediction_id"] not in evaluated_ids
+            prediction
+            for prediction in predictions
+            if prediction["prediction_id"] not in evaluated_ids
+            and prediction["prediction_id"] not in superseded_prediction_ids
         ]
         exact_hits = sum(
             evaluation["outcome"]["status"] == "exact"
@@ -505,6 +515,7 @@ class PredictionLedger:
             },
             "pending_count": len(pending),
             "embedded_pending_count": embedded_latest_count,
+            "superseded_prediction_count": len(superseded_prediction_ids),
             "pending_by_product": dict(sorted(pending_by_product.items())),
             "pending_predictions": pending_predictions,
             "pending_embedding_note": (
@@ -2074,18 +2085,28 @@ def _validate_backtest_trial_disposition_log(backtest: dict[str, Any]) -> None:
             raise ValueError("Backtest trial_disposition_log rejected reason missing")
 
 
-def _forecast_events(dataset: ProductDataset) -> list[dict[str, Any]]:
+def _forecast_events(
+    dataset: ProductDataset,
+    existing_predictions: Iterable[dict[str, Any]] = (),
+) -> list[dict[str, Any]]:
     product = dataset.product
     latest = dataset.latest
     generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     dataset_observed_at = dataset.latest_fetched_at or f"{latest.draw_date.isoformat()}T00:00:00+00:00"
     fingerprint = dataset.history_fingerprint
+    duplicate_history = _recent_prediction_signatures(product, existing_predictions)
     if product.kind is AnalysisKind.NUMBER_SET:
-        forecasts = _number_forecasts(dataset)
+        forecasts = _number_forecasts(dataset, duplicate_history)
     else:
-        forecasts = _digit_forecasts(dataset)
+        forecasts = _digit_forecasts(dataset, duplicate_history)
     events = []
     for forecast in forecasts:
+        prediction_payload = json.dumps(
+            forecast["prediction"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         identity = "|".join(
             (
                 product.slug,
@@ -2093,6 +2114,7 @@ def _forecast_events(dataset: ProductDataset) -> list[dict[str, Any]]:
                 forecast["strategy"],
                 MODEL_VERSION,
                 fingerprint,
+                prediction_payload,
             )
         )
         events.append(
@@ -2112,6 +2134,10 @@ def _forecast_events(dataset: ProductDataset) -> list[dict[str, Any]]:
                 "dataset_cutoff_timezone": "Asia/Ho_Chi_Minh",
                 "dataset_fingerprint": fingerprint,
                 "target": "first_confirmed_draw_after_cutoff",
+                "target_description": (
+                    f"First confirmed {product.name} draw after cutoff #{latest.draw_id}"
+                ),
+                "target_cutoff_policy": "do_not_infer_unconfirmed_draw_ids",
                 "prediction": forecast["prediction"],
                 "parameters": forecast["parameters"],
                 "research_only": True,
@@ -2120,7 +2146,108 @@ def _forecast_events(dataset: ProductDataset) -> list[dict[str, Any]]:
     return events
 
 
-def _number_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
+def _recent_prediction_signatures(
+    product: AnalyticsProduct,
+    predictions: Iterable[dict[str, Any]],
+) -> dict[str, set[PredictionSignature]]:
+    history: dict[str, set[PredictionSignature]] = defaultdict(set)
+    rows = [
+        prediction
+        for prediction in predictions
+        if prediction.get("event_type") == "prediction"
+        and prediction.get("product") == product.slug
+        and prediction.get("strategy") != "uniform_seeded"
+    ]
+    rows.sort(key=_prediction_order, reverse=True)
+    counts: Counter[str] = Counter()
+    for prediction in rows:
+        strategy = str(prediction.get("strategy", ""))
+        if counts[strategy] >= DUPLICATE_GUARD_HISTORY_LIMIT:
+            continue
+        signature = _prediction_signature(product, prediction.get("prediction", {}))
+        if signature is None:
+            continue
+        history[strategy].add(signature)
+        counts[strategy] += 1
+    return history
+
+
+def _prediction_signature(
+    product: AnalyticsProduct,
+    prediction: dict[str, Any],
+) -> PredictionSignature | None:
+    if product.kind is AnalysisKind.NUMBER_SET:
+        numbers = prediction.get("numbers")
+        if not isinstance(numbers, list):
+            return None
+        return ("numbers", tuple(sorted(int(value) for value in numbers)))
+    sequence = prediction.get("sequence")
+    if sequence is None:
+        return None
+    return ("sequence", str(sequence))
+
+
+def _superseded_prediction_ids(
+    predictions: Iterable[dict[str, Any]],
+    evaluated_ids: Iterable[str] = (),
+) -> set[str]:
+    evaluated = set(evaluated_ids)
+    grouped: dict[tuple[object, ...], list[dict[str, Any]]] = defaultdict(list)
+    for prediction in predictions:
+        prediction_id = str(prediction.get("prediction_id", ""))
+        if not prediction_id or prediction_id in evaluated:
+            continue
+        grouped[
+            (
+                prediction.get("product"),
+                prediction.get("strategy"),
+                prediction.get("dataset_cutoff_date"),
+                prediction.get("dataset_cutoff_draw_id"),
+                prediction.get("target", "first_confirmed_draw_after_cutoff"),
+            )
+        ].append(prediction)
+
+    superseded: set[str] = set()
+    for rows in grouped.values():
+        if len(rows) < 2:
+            continue
+        keeper = max(rows, key=_prediction_order)
+        keeper_id = str(keeper.get("prediction_id", ""))
+        superseded.update(
+            str(row.get("prediction_id", ""))
+            for row in rows
+            if str(row.get("prediction_id", "")) != keeper_id
+        )
+    return superseded
+
+
+def _duplicate_guard_payload(
+    *,
+    adjusted: bool,
+    forbidden_count: int,
+    attempts: int,
+    basis: str,
+    applied: bool = True,
+) -> dict[str, object]:
+    return {
+        "applied": applied,
+        "adjusted": adjusted,
+        "basis": basis,
+        "history_limit_per_strategy": DUPLICATE_GUARD_HISTORY_LIMIT,
+        "forbidden_signature_count": forbidden_count,
+        "replacement_attempts": attempts,
+        "policy": (
+            "avoid_same_strategy_recent_repeat_and_same_cutoff_strategy_duplicate"
+            if applied
+            else "baseline_seeded_pick_can_repeat_by_design"
+        ),
+    }
+
+
+def _number_forecasts(
+    dataset: ProductDataset,
+    duplicate_history: dict[str, set[PredictionSignature]] | None = None,
+) -> list[dict[str, Any]]:
     product = dataset.product
     observations = dataset.observations
     total_counts = Counter(value for item in observations for value in item.values)
@@ -2153,23 +2280,58 @@ def _number_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
     _apply_audit_number_scores(scores, pair_scores)
     seed = f"{product.slug}|{dataset.latest.draw_id}|{MODEL_VERSION}"
     uniform = _uniform_number_pick(product, seed)
-    balanced = _top_numbers(scores, "balanced", product.pick_count or 0, seed)
-    recent = _top_numbers(scores, "recent", product.pick_count or 0, seed)
-    audit_signal = _audit_number_pick(
-        scores,
-        pair_scores,
-        product.pick_count or 0,
-        seed + "|audit",
-    )
-
     special_predictions = _special_forecasts(dataset, seed)
+    duplicate_history = duplicate_history or {}
+    used_signatures: set[PredictionSignature] = set()
     result = []
-    for strategy, label, values in (
-        ("uniform_seeded", "Baseline đồng đều có seed", uniform),
-        ("balanced_signal", "Tín hiệu cân bằng", balanced),
-        ("recent_frequency", "Tần suất cửa sổ gần", recent),
-        ("audit_signal", "Tín hiệu kiểm định công bằng", audit_signal),
+    strategy_rows: list[tuple[str, str, list[int], dict[str, object]]] = [
+        (
+            "uniform_seeded",
+            "Baseline đồng đều có seed",
+            uniform,
+            _duplicate_guard_payload(
+                adjusted=False,
+                forbidden_count=0,
+                attempts=0,
+                basis="main_numbers",
+                applied=False,
+            ),
+        )
+    ]
+    for strategy, label, score_key, strategy_seed in (
+        ("balanced_signal", "Tín hiệu cân bằng", "balanced", seed),
+        ("recent_frequency", "Tần suất cửa sổ gần", "recent", seed),
+        ("audit_signal", "Tín hiệu kiểm định công bằng", "audit", seed + "|audit"),
     ):
+        if strategy == "audit_signal":
+            base_values = _audit_number_pick(
+                scores,
+                pair_scores,
+                product.pick_count or 0,
+                strategy_seed,
+            )
+        else:
+            base_values = _top_numbers(
+                scores,
+                score_key,
+                product.pick_count or 0,
+                strategy_seed,
+            )
+        forbidden = set(duplicate_history.get(strategy, set())) | used_signatures
+        values, guard = _guard_number_prediction(
+            product,
+            scores,
+            score_key,
+            product.pick_count or 0,
+            strategy_seed,
+            base_values,
+            forbidden,
+        )
+        signature = _prediction_signature(product, {"numbers": values})
+        if signature is not None:
+            used_signatures.add(signature)
+        strategy_rows.append((strategy, label, values, guard))
+    for strategy, label, values, duplicate_guard in strategy_rows:
         score_policy = (
             AUDIT_NUMBER_SCORE_POLICY
             if strategy == "audit_signal"
@@ -2192,13 +2354,17 @@ def _number_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
                     "pool_size": product.pool_size,
                     "score_policy": score_policy,
                     "seed_policy": "sha256(product, cutoff, model_version)",
+                    "duplicate_guard": duplicate_guard,
                 },
             }
         )
     return result
 
 
-def _digit_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
+def _digit_forecasts(
+    dataset: ProductDataset,
+    duplicate_history: dict[str, set[PredictionSignature]] | None = None,
+) -> list[dict[str, Any]]:
     product = dataset.product
     length = product.sequence_length or 0
     symbols = list(range(product.sequence_min, product.sequence_max + 1))
@@ -2224,10 +2390,9 @@ def _digit_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
     seed = f"{product.slug}|{dataset.latest.draw_id}|{MODEL_VERSION}"
     uniform_rng = random.Random(_seed_int(seed + "|uniform"))
     uniform = "".join(str(uniform_rng.choice(symbols)) for _ in range(length))
-    recent_mode = _digit_sequence_from_scores(total, recent, short, symbols, "recent", seed)
-    balanced = _digit_sequence_from_scores(total, recent, short, symbols, "balanced", seed)
-    audit_signal = _digit_sequence_from_scores(total, recent, short, symbols, "audit", seed)
-    return [
+    duplicate_history = duplicate_history or {}
+    used_signatures: set[PredictionSignature] = set()
+    result = [
         {
             "strategy": "uniform_seeded",
             "strategy_label": "Baseline đồng đều có seed",
@@ -2240,51 +2405,58 @@ def _digit_forecasts(dataset: ProductDataset) -> list[dict[str, Any]]:
                 "symbol_min": product.sequence_min,
                 "symbol_max": product.sequence_max,
                 "score_policy": DIGIT_SCORE_POLICY,
+                "duplicate_guard": _duplicate_guard_payload(
+                    adjusted=False,
+                    forbidden_count=0,
+                    attempts=0,
+                    basis="sequence",
+                    applied=False,
+                ),
             },
-        },
-        {
-            "strategy": "balanced_signal",
-            "strategy_label": "Tín hiệu cân bằng",
-            "prediction": {"sequence": balanced},
-            "parameters": {
-                "history_draws": len(dataset.observations),
-                "recent_window_draws": len(recent_draws),
-                "short_window_draws": len(short_draws),
-                "sequence_length": length,
-                "symbol_min": product.sequence_min,
-                "symbol_max": product.sequence_max,
-                "score_policy": DIGIT_SCORE_POLICY,
-            },
-        },
-        {
-            "strategy": "recent_frequency",
-            "strategy_label": "Tần suất cửa sổ gần",
-            "prediction": {"sequence": recent_mode},
-            "parameters": {
-                "history_draws": len(dataset.observations),
-                "recent_window_draws": len(recent_draws),
-                "short_window_draws": len(short_draws),
-                "sequence_length": length,
-                "symbol_min": product.sequence_min,
-                "symbol_max": product.sequence_max,
-                "score_policy": DIGIT_SCORE_POLICY,
-            },
-        },
-        {
-            "strategy": "audit_signal",
-            "strategy_label": "Tín hiệu kiểm định công bằng",
-            "prediction": {"sequence": audit_signal},
-            "parameters": {
-                "history_draws": len(dataset.observations),
-                "recent_window_draws": len(recent_draws),
-                "short_window_draws": len(short_draws),
-                "sequence_length": length,
-                "symbol_min": product.sequence_min,
-                "symbol_max": product.sequence_max,
-                "score_policy": AUDIT_DIGIT_SCORE_POLICY,
-            },
-        },
+        }
     ]
+    for strategy, label, score_strategy, score_policy in (
+        ("balanced_signal", "Tín hiệu cân bằng", "balanced", DIGIT_SCORE_POLICY),
+        ("recent_frequency", "Tần suất cửa sổ gần", "recent", DIGIT_SCORE_POLICY),
+        ("audit_signal", "Tín hiệu kiểm định công bằng", "audit", AUDIT_DIGIT_SCORE_POLICY),
+    ):
+        rankings = _digit_rankings_from_scores(
+            total,
+            recent,
+            short,
+            symbols,
+            score_strategy,
+            seed,
+        )
+        base_sequence = _digit_sequence_from_rankings(rankings)
+        forbidden = set(duplicate_history.get(strategy, set())) | used_signatures
+        sequence, duplicate_guard = _guard_digit_prediction(
+            product,
+            rankings,
+            base_sequence,
+            forbidden,
+        )
+        signature = _prediction_signature(product, {"sequence": sequence})
+        if signature is not None:
+            used_signatures.add(signature)
+        result.append(
+            {
+                "strategy": strategy,
+                "strategy_label": label,
+                "prediction": {"sequence": sequence},
+                "parameters": {
+                    "history_draws": len(dataset.observations),
+                    "recent_window_draws": len(recent_draws),
+                    "short_window_draws": len(short_draws),
+                    "sequence_length": length,
+                    "symbol_min": product.sequence_min,
+                    "symbol_max": product.sequence_max,
+                    "score_policy": score_policy,
+                    "duplicate_guard": duplicate_guard,
+                },
+            }
+        )
+    return result
 
 
 def _number_backtest(dataset: ProductDataset) -> dict[str, object]:
@@ -3137,7 +3309,7 @@ def _digit_backtest(dataset: ProductDataset) -> dict[str, object]:
         ),
         "strategy_pairwise_comparisons": strategy_pairwise_comparisons,
         "warning": (
-            "Baseline được tính chính xác trên toàn bộ không gian chuỗi hợp lệ của từng kỳ. "
+            "Baseline đồng đều có seed",
             "Các kết quả cùng một kỳ ở trò chơi nhiều hạng giải không hoàn toàn độc lập, "
             "vì vậy p-value vẫn chỉ là xấp xỉ và cần được đọc cùng kích thước hiệu ứng."
         ),
@@ -3321,6 +3493,62 @@ def _top_numbers(
     return sorted(ranked[:count])
 
 
+def _guard_number_prediction(
+    product: AnalyticsProduct,
+    scores: dict[int, dict[str, float]],
+    score_key: str,
+    count: int,
+    seed: str,
+    base_values: list[int],
+    forbidden: set[PredictionSignature],
+) -> tuple[list[int], dict[str, object]]:
+    base_signature = _prediction_signature(product, {"numbers": base_values})
+    if base_signature not in forbidden:
+        return base_values, _duplicate_guard_payload(
+            adjusted=False,
+            forbidden_count=len(forbidden),
+            attempts=0,
+            basis="main_numbers",
+        )
+    if count <= 0:
+        return base_values, _duplicate_guard_payload(
+            adjusted=False,
+            forbidden_count=len(forbidden),
+            attempts=0,
+            basis="main_numbers",
+        )
+
+    ranked = sorted(
+        scores,
+        key=lambda value: (scores[value][score_key], _stable_jitter(seed, value)),
+        reverse=True,
+    )
+    rank = {value: index for index, value in enumerate(ranked)}
+    base_set = set(base_values)
+    removals = sorted(base_set, key=lambda value: rank.get(value, len(ranked)), reverse=True)
+    additions = [value for value in ranked if value not in base_set]
+    attempts = 0
+    for removed in removals:
+        for added in additions:
+            attempts += 1
+            candidate = sorted((base_set - {removed}) | {added})
+            signature = _prediction_signature(product, {"numbers": candidate})
+            if signature not in forbidden:
+                return candidate, _duplicate_guard_payload(
+                    adjusted=True,
+                    forbidden_count=len(forbidden),
+                    attempts=attempts,
+                    basis="main_numbers",
+                )
+
+    return base_values, _duplicate_guard_payload(
+        adjusted=False,
+        forbidden_count=len(forbidden),
+        attempts=attempts,
+        basis="main_numbers",
+    )
+
+
 def _uniform_number_pick(product: AnalyticsProduct, seed: str) -> list[int]:
     rng = random.Random(_seed_int(seed + "|uniform"))
     values = list(range(product.pool_min or 1, (product.pool_max or 0) + 1))
@@ -3382,6 +3610,108 @@ def _special_forecasts(dataset: ProductDataset, seed: str) -> dict[str, list[int
             seed + "|special",
         ),
     }
+
+
+def _digit_rankings_from_scores(
+    total: list[Counter[int]],
+    recent: list[Counter[int]],
+    short: list[Counter[int]],
+    symbols: list[int],
+    strategy: str,
+    seed: str,
+) -> list[list[int]]:
+    rankings = []
+    for position, (total_counter, recent_counter, short_counter) in enumerate(
+        zip(total, recent, short, strict=True)
+    ):
+        total_observations = sum(total_counter.values())
+        recent_observations = sum(recent_counter.values())
+        short_observations = sum(short_counter.values())
+        probability = 1 / len(symbols)
+        expected_total = total_observations * probability if total_observations else 0
+        expected_recent = recent_observations * probability if recent_observations else 0
+        expected_short = short_observations * probability if short_observations else 0
+        total_sd = math.sqrt(max(total_observations * probability * (1 - probability), 1e-12))
+        recent_sd = math.sqrt(max(recent_observations * probability * (1 - probability), 1e-12))
+        short_sd = math.sqrt(max(short_observations * probability * (1 - probability), 1e-12))
+        scores = {}
+        for digit in symbols:
+            long_z = (
+                (total_counter[digit] - expected_total) / total_sd
+                if total_observations
+                else 0
+            )
+            recent_z = (
+                (recent_counter[digit] - expected_recent) / recent_sd
+                if recent_observations
+                else 0
+            )
+            short_z = (
+                (short_counter[digit] - expected_short) / short_sd
+                if short_observations
+                else 0
+            )
+            if strategy == "recent":
+                score = 0.6 * short_z + 0.4 * recent_z
+            elif strategy == "audit":
+                score = (
+                    0.45 * _clip_signal(long_z)
+                    + 0.35 * _clip_signal(recent_z)
+                    + 0.2 * _clip_signal(short_z)
+                )
+            elif strategy == "short":
+                score = short_z
+            elif strategy == "long":
+                score = long_z
+            elif strategy == "balanced_no_long_penalty":
+                score = 0.4 * short_z + 0.3 * recent_z
+            elif strategy == "audit_unclipped":
+                score = 0.45 * long_z + 0.35 * recent_z + 0.2 * short_z
+            else:
+                score = 0.4 * short_z + 0.3 * recent_z - 0.2 * long_z
+            scores[digit] = score + _stable_jitter(f"{seed}|{position}", digit) * 1e-6
+        rankings.append(sorted(scores, key=scores.get, reverse=True))
+    return rankings
+
+
+def _digit_sequence_from_rankings(rankings: list[list[int]]) -> str:
+    return "".join(str(ranking[0]) for ranking in rankings if ranking)
+
+
+def _guard_digit_prediction(
+    product: AnalyticsProduct,
+    rankings: list[list[int]],
+    base_sequence: str,
+    forbidden: set[PredictionSignature],
+) -> tuple[str, dict[str, object]]:
+    base_signature = _prediction_signature(product, {"sequence": base_sequence})
+    if base_signature not in forbidden:
+        return base_sequence, _duplicate_guard_payload(
+            adjusted=False,
+            forbidden_count=len(forbidden),
+            attempts=0,
+            basis="sequence",
+        )
+    attempts = 0
+    for position in reversed(range(len(rankings))):
+        ranking = rankings[position]
+        for digit in ranking[1:]:
+            attempts += 1
+            candidate = f"{base_sequence[:position]}{digit}{base_sequence[position + 1:]}"
+            signature = _prediction_signature(product, {"sequence": candidate})
+            if signature not in forbidden:
+                return candidate, _duplicate_guard_payload(
+                    adjusted=True,
+                    forbidden_count=len(forbidden),
+                    attempts=attempts,
+                    basis="sequence",
+                )
+    return base_sequence, _duplicate_guard_payload(
+        adjusted=False,
+        forbidden_count=len(forbidden),
+        attempts=attempts,
+        basis="sequence",
+    )
 
 
 def _digit_sequence_from_scores(
@@ -3635,6 +3965,9 @@ def _evaluation_detail(
         "dataset_cutoff_draw_id": prediction["dataset_cutoff_draw_id"],
         "dataset_cutoff_date": prediction["dataset_cutoff_date"],
         "dataset_fingerprint": prediction["dataset_fingerprint"],
+        "target": prediction.get("target", "first_confirmed_draw_after_cutoff"),
+        "target_description": prediction.get("target_description"),
+        "target_cutoff_policy": prediction.get("target_cutoff_policy"),
         "prediction": predicted_result,
         "outcome": {
             "status": status,
@@ -3669,6 +4002,8 @@ def _pending_prediction_detail(prediction: dict[str, Any]) -> dict[str, Any]:
         "dataset_fingerprint": prediction["dataset_fingerprint"],
         "prediction": prediction["prediction"],
         "target": prediction.get("target", "first_confirmed_draw_after_cutoff"),
+        "target_description": prediction.get("target_description"),
+        "target_cutoff_policy": prediction.get("target_cutoff_policy"),
     }
 
 
